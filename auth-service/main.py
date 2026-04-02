@@ -1,64 +1,109 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel
 import logging
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import os
+from dotenv import load_dotenv
 
-app = FastAPI()
+from models import SignupRequest, LoginRequest, AuthResponse, VerifyTokenRequest, TokenResponse
+from database import init_db, query_db_single, execute_db
+from utils import hash_password, verify_password, create_token, verify_token
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+load_dotenv()
 
-# Fake database for demonstration
-fake_users_db = {}
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# OAuth2 password bearer token auth scheme
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting auth-service...")
+    try:
+        init_db()
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+    yield
+    logger.info("Shutting down auth-service...")
 
-class User(BaseModel):
-    username: str
-    email: str
-    disabled: bool = None
+app = FastAPI(title="Auth Service", lifespan=lifespan)
 
-class UserInDB(User):
-    hashed_password: str
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000", "http://localhost:8000"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-class Token(BaseModel):
-    access_token: str
-    token_type: str
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
 
-class TokenData(BaseModel):
-    username: str
+@app.post("/signup", response_model=AuthResponse)
+async def signup(request: SignupRequest):
+    try:
+        existing_user = query_db_single("SELECT id FROM users WHERE email = %s", (request.email,))
+        if existing_user:
+            logger.warning(f"Signup attempt with existing email: {request.email}")
+            raise HTTPException(status_code=400, detail="Email already registered")
+        password_hash = hash_password(request.password)
+        import psycopg2
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cursor = conn.cursor()
+        try:
+            cursor.execute("INSERT INTO users (email, password_hash) VALUES (%s, %s) RETURNING id", (request.email, password_hash))
+            user_id = cursor.fetchone()[0]
+            conn.commit()
+            logger.info(f"User created: {request.email}")
+        finally:
+            cursor.close()
+            conn.close()
+        token = create_token(user_id, request.email)
+        return AuthResponse(token=token, user_id=user_id, email=request.email)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Signup error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
+@app.post("/login", response_model=AuthResponse)
+async def login(request: LoginRequest):
+    try:
+        user = query_db_single("SELECT id, email, password_hash FROM users WHERE email = %s", (request.email,))
+        if not user:
+            logger.warning(f"Login attempt with non-existent email: {request.email}")
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        if not verify_password(request.password, user['password_hash']):
+            logger.warning(f"Failed login attempt for: {request.email}")
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token = create_token(user['id'], user['email'])
+        logger.info(f"User logged in: {request.email}")
+        return AuthResponse(token=token, user_id=user['id'], email=user['email'])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-def fake_hash_password(password: str):
-    return "fakehashed" + password
-
-@app.post("/signup", response_model=User)
-async def signup(user: User):
-    if user.username in fake_users_db:
-        raise HTTPException(status_code=400, detail="Username already registered")
-    fake_users_db[user.username] = UserInDB(**user.dict(), hashed_password=fake_hash_password("examplepassword"))
-    logging.info(f"New user signed up: {user.username}")
-    return user
-
-@app.post("/token", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = fake_users_db.get(form_data.username)
-    if not user or not (user.hashed_password == fake_hash_password(form_data.password)):
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-    logging.info(f"User logged in: {form_data.username}")
-    return {"access_token": user.username, "token_type": "bearer"}
-
-@app.get("/users/me", response_model=User)
-async def read_users_me(token: str = Depends(oauth2_scheme)):
-    username = token  # In a real application, you'd decode the token to get the username
-    user = fake_users_db.get(username)
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    logging.info(f"User info accessed: {username}")
-    return user
+@app.post("/verify-token", response_model=TokenResponse)
+async def verify_token_endpoint(request: VerifyTokenRequest):
+    try:
+        payload = verify_token(request.token)
+        if not payload:
+            return TokenResponse(valid=False)
+        return TokenResponse(valid=True, user_id=payload.get('user_id'))
+    except Exception as e:
+        logger.error(f"Token verification error: {e}")
+        return TokenResponse(valid=False)
 
 @app.post("/refresh")
-async def refresh_token(token: str = Depends(oauth2_scheme)):
-    # This would usually involve validating the token and generating a new one
-    return {"access_token": token, "token_type": "bearer"}
+async def refresh_token(request: VerifyTokenRequest):
+    try:
+        payload = verify_token(request.token)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        new_token = create_token(payload['user_id'], payload['email'])
+        logger.info(f"Token refreshed for user {payload['user_id']}")
+        return {"token": new_token}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Token refresh error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
